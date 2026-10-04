@@ -1,15 +1,17 @@
 import {createServer} from 'node:http';
-import {readFileSync} from 'node:fs';
+import {createReadStream, readFileSync, statSync} from 'node:fs';
 import {randomUUID} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import {createDatabase, isDatabaseReady} from './database.mjs';
 
 const setupPage = readFileSync(new URL('../web/setup.html', import.meta.url), 'utf8');
+const demoPagePath = new URL('../../sample-briefing/prototype/nomi-briefing.html', import.meta.url);
+const demoAudioPath = new URL('../../sample-briefing/prototype/briefing.mp3', import.meta.url);
 const DEFAULT_READY_TIMEOUT_MS = 1500;
 
 export function assertProductionLaunchAllowed({nodeEnv = process.env.NODE_ENV, launchMode = process.env.NOMI_LAUNCH_MODE} = {}) {
-  if (nodeEnv === 'production' && launchMode !== 'setup') {
-    throw new Error('Production requires NOMI_LAUNCH_MODE=setup');
+  if (nodeEnv === 'production' && !['setup', 'demo'].includes(launchMode)) {
+    throw new Error('Production requires NOMI_LAUNCH_MODE=setup or demo');
   }
 }
 
@@ -24,6 +26,10 @@ export function makeServer({
   readyTimeoutMs = timeoutValue(process.env.NOMI_DB_TIMEOUT_MS),
 } = {}) {
   const setupMode = launchMode === 'setup';
+  const demoMode = launchMode === 'demo';
+  const stage = demoMode ? 'demo' : 'setup';
+  const demoPage = demoMode ? readFileSync(demoPagePath, 'utf8') : null;
+  const demoAudioSize = demoMode ? statSync(demoAudioPath).size : null;
 
   return createServer((req, res) => {
     const requestId = randomUUID();
@@ -35,14 +41,88 @@ export function makeServer({
     const reply = (status, body) => {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.writeHead(status);
-      res.end(JSON.stringify({...body, requestId}));
+      res.end(req.method === 'HEAD' ? undefined : JSON.stringify({...body, requestId}));
     };
-    const replyPage = () => {
+    const replyPage = (page = setupPage, contentSecurityPolicy = "default-src 'none'; style-src 'unsafe-inline'; font-src data:; img-src 'self' data:; base-uri 'none'; form-action 'none'") => {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; font-src data:; img-src 'self' data:; base-uri 'none'; form-action 'none'");
+      res.setHeader('Content-Security-Policy', contentSecurityPolicy);
       res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+      res.setHeader('Content-Length', Buffer.byteLength(page));
       res.writeHead(200);
-      res.end(setupPage);
+      res.end(req.method === 'HEAD' ? undefined : page);
+    };
+    const replyDemoPage = () => {
+      return replyPage(demoPage, "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; font-src data:; img-src 'self' data:; media-src 'self'; connect-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'");
+    };
+    const replyDemoAudio = () => {
+      const total = demoAudioSize;
+      const range = req.headers.range;
+      let start = 0;
+      let end = total - 1;
+      let partial = false;
+
+      if (range !== undefined) {
+        const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+        if (!match) {
+          res.setHeader('Content-Range', `bytes */${total}`);
+          return reply(416, {error: 'range_not_satisfiable'});
+        }
+        if (match[1] === '' && match[2] === '') {
+          res.setHeader('Content-Range', `bytes */${total}`);
+          return reply(416, {error: 'range_not_satisfiable'});
+        }
+        if (match[1] === '') {
+          const suffixLength = Number(match[2]);
+          if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) {
+            res.setHeader('Content-Range', `bytes */${total}`);
+            return reply(416, {error: 'range_not_satisfiable'});
+          }
+          start = Math.max(total - suffixLength, 0);
+        } else {
+          start = Number(match[1]);
+          if (!Number.isSafeInteger(start) || start >= total) {
+            res.setHeader('Content-Range', `bytes */${total}`);
+            return reply(416, {error: 'range_not_satisfiable'});
+          }
+          if (match[2] !== '') {
+            end = Number(match[2]);
+            if (!Number.isSafeInteger(end) || end < start) {
+              res.setHeader('Content-Range', `bytes */${total}`);
+              return reply(416, {error: 'range_not_satisfiable'});
+            }
+          }
+        }
+        end = Math.min(end, total - 1);
+        partial = true;
+      }
+
+      const length = end - start + 1;
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Content-Length', length);
+      if (partial) {
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+        res.writeHead(206);
+      } else {
+        res.writeHead(200);
+      }
+      if (req.method === 'HEAD') return res.end();
+
+      const stream = createReadStream(demoAudioPath, {start, end});
+      const abort = () => stream.destroy();
+      req.once('aborted', abort);
+      res.once('close', abort);
+      stream.once('error', () => {
+        req.off('aborted', abort);
+        res.off('close', abort);
+        if (!res.headersSent) reply(500, {error: 'media_unavailable'});
+        else res.destroy();
+      });
+      stream.once('close', () => {
+        req.off('aborted', abort);
+        res.off('close', abort);
+      });
+      stream.pipe(res);
     };
 
     let path;
@@ -55,25 +135,27 @@ export function makeServer({
       return;
     }
 
-    if (req.method !== 'GET') {
-      res.setHeader('Allow', 'GET');
+    if (!['GET', 'HEAD'].includes(req.method)) {
+      res.setHeader('Allow', 'GET, HEAD');
       return reply(405, {error: 'method_not_allowed'});
     }
     if (path === '/' && setupMode) return replyPage();
+    if (demoMode && (path === '/' || path === '/nomi-briefing.html')) return replyDemoPage();
+    if (demoMode && path === '/briefing.mp3') return replyDemoAudio();
     if (path === '/health/live') {
-      return reply(200, {status: 'ok', service: 'nomi-api', stage: 'setup'});
+      return reply(200, {status: 'ok', service: 'nomi-api', stage});
     }
     if (path === '/health/ready') {
       return isDatabaseReady(database, {timeoutMs: readyTimeoutMs}).then((ready) => {
         if (ready) return reply(200, {
           status: 'ready',
-          stage: 'setup',
+          stage,
           applicationReady: false,
           dependencies: {database: 'connected'},
         });
         return reply(503, {
           status: 'not_ready',
-          stage: 'setup',
+          stage,
           applicationReady: false,
           dependencies: {database: 'not_connected'},
         });
@@ -84,8 +166,9 @@ export function makeServer({
         name: 'نومي',
         locale: 'ar-SA',
         direction: 'rtl',
-        stage: 'setup',
+        stage,
         applicationReady: false,
+        sampleAvailable: demoMode,
         newsAvailable: false,
       });
     }
