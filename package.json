@@ -1,0 +1,14 @@
+{
+  "name": "nomi-foundation",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "start": "node apps/api/server.mjs",
+    "test": "node --test",
+    "check": "node --check apps/api/server.mjs && node --check packages/editorial/policy.mjs"
+  }
+}
