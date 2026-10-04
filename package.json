@@ -9,6 +9,9 @@
   "scripts": {
     "start": "node apps/api/server.mjs",
     "test": "node --test",
-    "check": "node --check apps/api/server.mjs && node --check packages/editorial/policy.mjs"
+    "check": "node --check apps/api/server.mjs && node --check apps/api/database.mjs && node --check packages/editorial/policy.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
   }
 }
